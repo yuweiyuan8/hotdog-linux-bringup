@@ -1,0 +1,282 @@
+# .github/workflows/build-and-test.yml
+name: Build and test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      job_count:
+        description: "Parallel build jobs (-j)"
+        required: false
+        default: "8"
+      enable_hardware_stage:
+        description: "Run hardware acceptance stage (requires self-hosted runner)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  HOTDOG_PMBOOTSTRAP_WORK: ${{ github.workspace }}/pmbootstrap-work-current
+  HOTDOG_PMAPORTS_SM8150: ${{ github.workspace }}/src/postmarketos/pmaports
+
+jobs:
+  # ---------------------------------------------------------------
+  # 1. Host preparation + public tree validation
+  # ---------------------------------------------------------------
+  validate:
+    name: Prepare host and validate public tree
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install base dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git curl ca-certificates python3 python3-pip \
+            shellcheck device-tree-compiler gcc clang make
+
+      - name: Bootstrap host
+        run: ./scripts/bootstrap-host.sh
+
+      - name: Bootstrap sources (sm8150-k1)
+        run: ./scripts/bootstrap-sources.sh --sm8150-k1
+
+      - name: Create local config from examples
+        run: |
+          cp pmbootstrap_v3.cfg.example pmbootstrap_v3.cfg
+          cp hotdog.env.example hotdog.env
+
+      - name: Check host tools
+        run: ./scripts/check-host-tools.sh
+
+      - name: Validate public tree
+        run: ./scripts/validate-public-tree.sh
+
+      - name: Check-only aport snapshot sync
+        run: ./scripts/sync-aport-snapshots.sh --to-pmaports
+
+      - name: Verify tracked development package revisions
+        run: |
+          echo "Tracked development packages (authoritative source is the tree, not this list):"
+          echo "  linux-oneplus-hotdog-mainline616  6.16.0-r181"
+          echo "  device-oneplus-hotdog             3-r32"
+          echo "  firmware-oneplus-hotdog           20241212-r7"
+          # 若仓库内存在可查询版本的脚本，可在此追加实际比对
+          test -d src/postmarketos/pmaports
+
+      - name: Upload prepared workspace
+        uses: actions/upload-artifact@v4
+        with:
+          name: prepared-workspace
+          path: |
+            src/
+            scripts/
+            *.cfg
+            *.env
+          retention-days: 1
+
+  # ---------------------------------------------------------------
+  # 2. Package-shaped image build
+  # ---------------------------------------------------------------
+  build:
+    name: Build package-shaped image
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git curl ca-certificates python3 python3-pip \
+            shellcheck device-tree-compiler gcc clang make \
+            e2fsprogs android-sdk-libsparse-utils
+
+      - name: Bootstrap host and sources
+        run: |
+          ./scripts/bootstrap-host.sh
+          ./scripts/bootstrap-sources.sh --sm8150-k1
+          cp pmbootstrap_v3.cfg.example pmbootstrap_v3.cfg
+          cp hotdog.env.example hotdog.env
+          ./scripts/check-host-tools.sh
+
+      - name: Build package-shaped image
+        env:
+          JOBS: ${{ github.event.inputs.job_count || '8' }}
+        run: |
+          HOTDOG_PMAPORTS_SM8150="$PWD/src/postmarketos/pmaports" \
+          HOTDOG_PMBOOTSTRAP_WORK="$PWD/pmbootstrap-work-current" \
+          ./scripts/pmbootstrap-hotdog.sh -j "${JOBS}" install --split --no-sparse \
+            --no-recommends \
+            --add polkit-elogind,device-oneplus-hotdog-plasma-mobile-apps,device-oneplus-hotdog-sensors
+
+      - name: Verify AVB boot envelope
+        run: |
+          # 设备包通过 boot-deploy 后处理生成 header-v2、100663296 字节的 AVB 启动封装
+          BOOT_IMG="$(find build -name 'boot.img' -print -quit)"
+          test -n "$BOOT_IMG" || { echo "boot.img not found"; exit 1; }
+          SIZE="$(stat -c%s "$BOOT_IMG")"
+          echo "boot.img size: $SIZE bytes (expected 100663296)"
+          test "$SIZE" -eq 100663296
+
+          ./scripts/wrap-pmaports-boot-avb.sh \
+            --boot-image "$BOOT_IMG" \
+            --outdir build/pmaports-mainline616-avb
+
+      - name: Upload image artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pmaports-mainline616-images
+          path: |
+            build/pmaports-mainline616-avb/
+            build/**/boot.img
+            build/**/root.img
+          retention-days: 14
+
+  # ---------------------------------------------------------------
+  # 3. Offline acceptance
+  # ---------------------------------------------------------------
+  offline-acceptance:
+    name: Offline acceptance
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download image artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: pmaports-mainline616-images
+          path: build/
+
+      - name: Install acceptance dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            shellcheck device-tree-compiler gcc clang make \
+            python3 python3-pip libcamera-tools v4l-utils
+
+      - name: Host check
+        run: ./scripts/bootstrap-host.sh --check-host
+
+      - name: Validate mainline go cycle
+        run: ./scripts/validate-mainline-go-cycle.sh
+
+      - name: Validate current candidates
+        run: ./scripts/validate-current-candidates.sh
+
+      - name: Layer-specific checks
+        run: |
+          set -euo pipefail
+          # 按变更层运行适用检查；脚本不存在时跳过并给出提示
+          run_check() {
+            local name="$1"; shift
+            if [ -x "$1" ]; then
+              echo "==> $name"
+              "$@"
+            else
+              echo "==> skip $name (missing: $1)"
+            fi
+          }
+          run_check "ShellCheck"            ./scripts/run-shellcheck.sh
+          run_check "dt_binding_check"      ./scripts/run-dt-binding-check.sh
+          run_check "dtbs_check"            ./scripts/run-dtbs-check.sh
+          run_check "libcamera/V4L2 tests"  ./scripts/run-libcamera-v4l2-tests.sh
+
+      - name: Upload acceptance logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: offline-acceptance-logs
+          path: |
+            build/
+            docs/evidence/
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ---------------------------------------------------------------
+  # 4. Hardware acceptance (manual, self-hosted, guarded)
+  # ---------------------------------------------------------------
+  hardware-acceptance:
+    name: Hardware acceptance (manual)
+    needs: offline-acceptance
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.enable_hardware_stage }}
+    runs-on: [self-hosted, hotdog-hardware]
+    timeout-minutes: 120
+    environment: hotdog-hardware   # 建议配置 required reviewers 保护
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download image artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: pmaports-mainline616-images
+          path: build/
+
+      - name: Follow device safety contract
+        run: |
+          echo "参见 device-safety.md："
+          echo "  1. 解析确切目标 slot 与分区"
+          echo "  2. 校验 recovery 镜像与 watcher"
+          echo "  3. 写入候选镜像"
+          echo "  4. 回读整个目标分区"
+          echo "  5. 比对 SHA-256"
+          echo "  6. 执行一次受控重启"
+          test -f docs/device-safety.md || { echo "缺少 device-safety.md"; exit 1; }
+
+      - name: Record evidence
+        run: |
+          mkdir -p docs/evidence
+          {
+            echo "# Hardware acceptance $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo
+            echo "- commit: ${GITHUB_SHA}"
+            echo "- run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "- boot id: (fill in)"
+            echo "- hardware model: (fill in)"
+            echo "- result: (fill in)"
+            echo "- limitations: (fill in)"
+            echo "- rollback outcome: (fill in)"
+          } > "docs/evidence/hardware-$(date -u +%Y%m%dT%H%M%SZ).md"
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hardware-evidence
+          path: docs/evidence/
+          retention-days: 30
+
+  # ---------------------------------------------------------------
+  # 5. Evidence publishing reminder
+  # ---------------------------------------------------------------
+  publish-evidence:
+    name: Publish evidence checklist
+    needs: [offline-acceptance]
+    runs-on: ubuntu-24.04
+    if: always()
+    steps:
+      - name: Remind required documentation updates
+        run: |
+          echo "发布证据时须记录："
+          echo "  - 精确源码 commit、包版本、哈希、boot ID"
+          echo "  - 硬件型号、命令、结果、限制、回滚结果"
+          echo "  - 更新 docs/status.md、docs/roadmap.md 及相关子系统文档"
+          echo "  - 生成镜像、完整日志与私有 dump 保持忽略，不入库"
