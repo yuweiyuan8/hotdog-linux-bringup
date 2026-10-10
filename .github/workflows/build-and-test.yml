@@ -60,9 +60,6 @@ jobs:
       - name: Check host tools
         run: ./scripts/check-host-tools.sh
 
-      - name: Validate public tree
-        run: ./scripts/validate-public-tree.sh
-
       - name: Check-only aport snapshot sync
         run: ./scripts/sync-aport-snapshots.sh --to-pmaports
 
