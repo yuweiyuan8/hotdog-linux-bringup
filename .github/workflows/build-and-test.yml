@@ -104,8 +104,21 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             git curl ca-certificates python3 python3-pip \
             shellcheck device-tree-compiler gcc clang make \
-            e2fsprogs android-sdk-libsparse-utils
+            e2fsprogs android-sdk-libsparse-utils android-sdk-platform-tools
 
+      - name: Install mkbootimg
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/mkbootimg.git /tmp/mkbootimg
+          cd /tmp/mkbootimg
+          sed -i 's/ -O[0-3]//' Makefile
+          make CFLAGS='-O2'
+          sudo mv mkbootimg /usr/local/bin/
+
+      - name: Init pmbootstrap workdir
+        run: |
+           mkdir -p "$HOTDOG_PMBOOTSTRAP_WORK"
+           echo -e '\n\n' | pmbootstrap init || true
+           
       - name: Bootstrap host and sources
         run: |
           ./scripts/bootstrap-host.sh
@@ -113,7 +126,7 @@ jobs:
           cp pmbootstrap_v3.cfg.example pmbootstrap_v3.cfg
           cp hotdog.env.example hotdog.env
           ./scripts/check-host-tools.sh
-
+    
       - name: Build package-shaped image
         env:
           JOBS: ${{ github.event.inputs.job_count || '8' }}
